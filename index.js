@@ -1,14 +1,18 @@
 const { Toolkit } = require("actions-toolkit");
 const { execSync } = require("child_process");
-const core = require("@actions/core");
 const github = require("@actions/github");
-
-const PR_NUMBER = github.context.payload.number;
 
 // Change working directory if user defined PACKAGEJSON_DIR
 if (process.env.PACKAGEJSON_DIR) {
   process.env.GITHUB_WORKSPACE = `${process.env.GITHUB_WORKSPACE}/${process.env.PACKAGEJSON_DIR}`;
   process.chdir(process.env.GITHUB_WORKSPACE);
+}
+
+function getNewVersion(version, prNumber) {
+  const newVersion = execSync(`npm version --git-tag-version=false ${version}`)
+    .toString()
+    .trim();
+  return prNumber ? newVersion.replace(/\d*$/, prNumber) : newVersion;
 }
 
 // Run your GitHub Action!
@@ -41,6 +45,10 @@ Toolkit.run(async tools => {
   }
 
   try {
+    const PR_NUMBER = [...messages]
+      .pop()
+      .match(/Merge pull request\s#\d*/)[0]
+      .replace("Merge pull request #", "");
     const current = pkg.version.toString();
     // set git user
     await tools.runInWorkspace("git", [
@@ -57,29 +65,18 @@ Toolkit.run(async tools => {
     const currentBranch = /refs\/[a-zA-Z]+\/(.*)/.exec(
       process.env.GITHUB_REF
     )[1];
-    console.log(
-      "github.context.payload.head.ref: ",
-      github.context.payload.head.ref
-    );
-    console.log("currentBranch:", currentBranch, process.env.GITHUB_REF);
+    console.log("currentBranch:", currentBranch);
 
     // do it in the current checked out github branch (DETACHED HEAD)
     // important for further usage of the package.json version
-    await tools.runInWorkspace("git", [
-      "checkout",
-      github.context.payload.head.ref
-    ]);
     await tools.runInWorkspace("npm", [
       "version",
       "--allow-same-version=true",
       "--git-tag-version=false",
       current
     ]);
-
     console.log("current:", current, "/", "version:", version);
-    let newVersion = execSync(`npm version --git-tag-version=false ${version}`)
-      .toString()
-      .trim();
+    const newVersion = getNewVersion(version, PR_NUMBER);
     await tools.runInWorkspace("git", [
       "commit",
       "-a",
@@ -96,23 +93,32 @@ Toolkit.run(async tools => {
       current
     ]);
     console.log("current:", current, "/", "version:", version);
-    newVersion = execSync(`npm version --git-tag-version=false ${version}`)
-      .toString()
-      .trim();
-    newVersion = `${process.env["INPUT_TAG-PREFIX"]}${newVersion}`;
+    const newVersionWithPrefix = `${
+      process.env["INPUT_TAG-PREFIX"]
+    }${getNewVersion(version, PR_NUMBER)}`;
     console.log("new version:", newVersion);
     await tools.runInWorkspace("git", [
       "commit",
       "-a",
       "-m",
-      `ci: ${commitMessage} ${newVersion}`
+      `ci: ${commitMessage} ${newVersionWithPrefix}`
     ]);
 
     const remoteRepo = `https://${process.env.GITHUB_ACTOR}:${process.env.GITHUB_TOKEN}@github.com/${process.env.GITHUB_REPOSITORY}.git`;
-
-    await tools.runInWorkspace("git", ["tag", newVersion]);
+    // console.log(Buffer.from(remoteRepo).toString('base64'))
+    console.log("remoteRepo: ", remoteRepo);
+    await tools.runInWorkspace("git", ["tag", newVersionWithPrefix]);
     await tools.runInWorkspace("git", ["push", remoteRepo, "--follow-tags"]);
     await tools.runInWorkspace("git", ["push", remoteRepo, "--tags"]);
+
+    const defaultBranch = github.context.payload.repository.default_branch;
+    if (currentBranch !== defaultBranch) {
+      console.log("Checkout the default branch and rebase onto master");
+      console.log("remoteRepo: ", remoteRepo);
+      await tools.runInWorkspace("git", ["checkout", defaultBranch]);
+      await tools.runInWorkspace("git", ["rebase", currentBranch]);
+      await tools.runInWorkspace("git", ["push", remoteRepo, "--force"]);
+    }
   } catch (e) {
     tools.log.fatal(e);
     tools.exit.failure("Failed to bump version");
